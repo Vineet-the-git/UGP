@@ -60,7 +60,7 @@ class RNA_UNSHARED(nn.Module):
         n_batch: int = 0,
         n_labels: int = 0,
         n_hidden: int = 128,
-        n_latent: int = 10,
+        n_latent: int = 20,
         n_layers: int = 1,
         dropout_rate: float = 0.1,
         dispersion: str = "gene",

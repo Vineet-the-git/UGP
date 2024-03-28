@@ -1098,3 +1098,192 @@ class EncoderPROTEINVI_UNSHARED(nn.Module):
 
         # return qz_m, qz_v, ql_m, ql_v, latent, untran_latent
         return qz_m, qz_v, latent, untran_latent
+
+
+class DecoderTOTALVI_SHARED(nn.Module):
+    r"""Decodes data from latent space of ``n_input`` dimensions ``n_output``
+    dimensions using a linear decoder
+
+    :param n_input: The dimensionality of the input (latent space)
+    :param n_output_genes: The dimensionality of the output (gene space)
+    :param n_output_proteins: The dimensionality of the output (protein space)
+    :param n_cat_list: A list containing the number of categories
+                       for each category of interest. Each category will be
+                       included using a one-hot encoding
+    """
+
+    def __init__(
+        self,
+        n_input: int,
+        n_output_genes: int,
+        n_output_proteins: int,
+        n_cat_list: Iterable[int] = None,
+        n_layers: int = 1,
+        n_hidden: int = 256,
+        dropout_rate: float = 0,
+    ):
+        super().__init__()
+        self.n_output_genes = n_output_genes
+        self.n_output_proteins = n_output_proteins
+
+        self.px_decoder = FCLayers(
+            n_in=n_input,
+            n_out=n_hidden,
+            n_cat_list=n_cat_list,
+            n_layers=n_layers,
+            n_hidden=n_hidden,
+            dropout_rate=dropout_rate,
+        )
+
+        # mean gamma
+        self.px_scale_decoder = FCLayers(
+            n_in=n_hidden + n_input,
+            n_out=n_output_genes,
+            n_cat_list=n_cat_list,
+            n_layers=1,
+            use_relu=False,
+            use_batch_norm=False,
+            dropout_rate=0,
+        )
+
+        # background mean first decoder
+        self.py_back_decoder = FCLayers(
+            n_in=n_input,
+            n_out=n_hidden,
+            n_cat_list=n_cat_list,
+            n_layers=n_layers,
+            n_hidden=n_hidden,
+            dropout_rate=dropout_rate,
+        )
+        # background mean parameters second decoder
+        self.py_back_mean_log_alpha = FCLayers(
+            n_in=n_hidden + n_input,
+            n_out=n_output_proteins,
+            n_cat_list=n_cat_list,
+            n_layers=1,
+            use_relu=False,
+            use_batch_norm=False,
+            dropout_rate=0,
+        )
+        self.py_back_mean_log_beta = FCLayers(
+            n_in=n_hidden + n_input,
+            n_out=n_output_proteins,
+            n_cat_list=n_cat_list,
+            n_layers=1,
+            use_relu=False,
+            use_batch_norm=False,
+            dropout_rate=0,
+        )
+
+        # foreground increment decoder step 1
+        self.py_fore_decoder = FCLayers(
+            n_in=n_input,
+            n_out=n_hidden,
+            n_cat_list=n_cat_list,
+            n_layers=n_layers,
+            n_hidden=n_hidden,
+            dropout_rate=dropout_rate,
+        )
+        # foreground increment decoder step 2
+        self.py_fore_scale_decoder = FCLayers(
+            n_in=n_hidden + n_input,
+            n_out=n_output_proteins,
+            n_cat_list=n_cat_list,
+            n_layers=1,
+            use_relu=True,
+            use_batch_norm=False,
+            dropout_rate=0,
+        )
+
+        # dropout (mixture component for proteins, ZI probability for genes)
+        self.sigmoid_decoder = FCLayers(
+            n_in=n_input,
+            n_out=n_hidden,
+            n_cat_list=n_cat_list,
+            n_layers=n_layers,
+            n_hidden=n_hidden,
+            dropout_rate=dropout_rate,
+        )
+        self.px_dropout_decoder_gene = FCLayers(
+            n_in=n_hidden + n_input,
+            n_out=n_output_genes,
+            n_cat_list=n_cat_list,
+            n_layers=1,
+            use_relu=False,
+            use_batch_norm=False,
+            dropout_rate=0,
+        )
+
+        self.py_background_decoder = FCLayers(
+            n_in=n_hidden + n_input,
+            n_out=n_output_proteins,
+            n_cat_list=n_cat_list,
+            n_layers=1,
+            use_relu=False,
+            use_batch_norm=False,
+            dropout_rate=0,
+        )
+
+    def forward(self, z_gene: torch.Tensor, z_protein: torch.Tensor, library_gene: torch.Tensor, *cat_list: int):
+        r"""The forward computation for a single sample.
+
+         #. Decodes the data from the latent space using the decoder network
+         #. Returns local parameters for the ZINB distribution for genes
+         #. Returns local parameters for the Mixture NB distribution for proteins
+
+         We use the dictionary `px_` to contain the parameters of the ZINB/NB for genes.
+         The rate refers to the mean of the NB, dropout refers to Bernoulli mixing parameters.
+         `scale` refers to the quanity upon which differential expression is performed. For genes,
+         this can be viewed as the mean of the underlying gamma distribution.
+
+         We use the dictionary `py_` to contain the parameters of the Mixture NB distribution for proteins.
+         `rate_fore` refers to foreground mean, while `rate_back` refers to background mean. `scale` refers to
+         foreground mean adjusted for background probability and scaled to reside in simplex.
+         `back_alpha` and `back_beta` are the posterior parameters for `rate_back`.  `fore_scale` is the scaling
+         factor that enforces `rate_fore` > `rate_back`.
+
+        :param z: tensor with shape ``(n_input,)``
+        :param library_gene: library size
+        :param cat_list: list of category membership(s) for this sample
+        :return: parameters for the ZINB distribution of expression
+        :rtype: 3-tuple (first 2-tuple :py:class:`dict`, last :py:class:`torch.Tensor`)
+        """
+        px_ = {}
+        py_ = {}
+        gene_size = z_gene.size(0)
+
+        px = self.px_decoder(z_gene, *cat_list)
+        px_cat_z = torch.cat([px, z_gene], dim=-1)
+        px_["scale"] = nn.Softmax(dim=-1)(self.px_scale_decoder(px_cat_z, *cat_list))
+        px_["rate"] = library_gene[:gene_size] * px_["scale"]
+
+        py_back = self.py_back_decoder(z_protein, *cat_list)
+        py_back_cat_z = torch.cat([py_back, z_protein], dim=-1)
+
+        py_["back_alpha"] = self.py_back_mean_log_alpha(py_back_cat_z, *cat_list)
+        py_["back_beta"] = torch.exp(
+            self.py_back_mean_log_beta(py_back_cat_z, *cat_list)
+        )
+        log_pro_back_mean = Normal(py_["back_alpha"], py_["back_beta"]).rsample()
+        py_["rate_back"] = torch.exp(log_pro_back_mean)
+
+        py_fore = self.py_fore_decoder(z_protein, *cat_list)
+        py_fore_cat_z = torch.cat([py_fore, z_protein], dim=-1)
+        py_["fore_scale"] = (
+            self.py_fore_scale_decoder(py_fore_cat_z, *cat_list) + 1 + 1e-8
+        )
+        py_["rate_fore"] = py_["rate_back"] * py_["fore_scale"]
+
+        p_mixing = self.sigmoid_decoder(z_protein, *cat_list)
+        p_mixing_ = self.sigmoid_decoder(z_gene, *cat_list)
+        p_mixing_cat_z = torch.cat([p_mixing, z_protein], dim=-1)
+        p_mixing_cat_z_ = torch.cat([p_mixing_, z_gene], dim=-1)
+        px_["dropout"] = self.px_dropout_decoder_gene(p_mixing_cat_z_, *cat_list)
+        py_["mixing"] = self.py_background_decoder(p_mixing_cat_z, *cat_list)
+
+        protein_mixing = 1 / (1 + torch.exp(-py_["mixing"]))
+        py_["scale"] = torch.nn.functional.normalize(
+            (1 - protein_mixing) * py_["rate_fore"], p=1, dim=-1
+        )
+
+        return (px_, py_, log_pro_back_mean)

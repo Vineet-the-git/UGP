@@ -6,6 +6,7 @@ from .vaec import VAEC
 from .jvae import JVAE
 from .totalvi import TOTALVI
 from .proteinvi_unshared import PROTENVI_UNSHARED
+from .totalvi_shared import TOTALVI_SHARED
 
 __all__ = [
     "SCANVI",
@@ -17,4 +18,5 @@ __all__ = [
     "AutoZIVAE",
     "TOTALVI",
     "PROTENVI_UNSHARED",
+    "TOTALVI_SHARED",
 ]
